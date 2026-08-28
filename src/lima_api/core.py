@@ -2,9 +2,10 @@ import inspect
 import json
 import logging
 import sys
+from asyncio import Lock as AsyncLock
 from enum import Enum
 from inspect import Signature
-from threading import Lock
+from threading import Lock as SyncLock
 
 from .constants import KwargsMode
 
@@ -192,6 +193,7 @@ class LimaApiBase:
         default_exception: Optional[type[LimaException]] = None,
         client_kwargs: Optional[dict] = None,
         auto_start: bool = False,
+        auto_close: bool = True,
     ):
         """
         :param base_url: the base URL of the client
@@ -227,10 +229,22 @@ class LimaApiBase:
         self.client: Optional[Union[httpx.Client, httpx.AsyncClient]] = None
         self.client_kwargs.update(client_kwargs or {})
         self._auto_start: bool = auto_start
+        self._auto_close: bool = auto_close and auto_start
+        self._lock: Optional[Union[SyncLock, AsyncLock]] = None
+        self._open_connections = 0
 
     @property
     def auto_start(self) -> bool:
         return self._auto_start
+
+    @property
+    def auto_close(self) -> bool:
+        if self._auto_close and not self.auto_start:
+            msg = "auto_close not allowed with auto_start=False, setting off"
+            logging.warning(msg)
+            self.log(event=LogEvent.SETUP, msg=msg)
+            self._auto_close = False
+        return self._auto_close
 
     def log(self, *, event: LogEvent, **kwargs) -> None:
         """
@@ -278,11 +292,6 @@ class LimaApiBase:
         """
         if self.client is None:
             raise LimaException(detail="uninitialized client")
-
-        if sync and inspect.iscoroutinefunction(self.client.send):
-            raise LimaException(detail="sync function in async client")
-        elif not sync and not inspect.iscoroutinefunction(self.client.send):
-            raise LimaException(detail="async function in sync client")
 
         try:
             params = get_request_params(
@@ -442,6 +451,7 @@ class LimaApi(LimaApiBase):
         transport = httpx.AsyncHTTPTransport(retries=self.retries)
         self.transport: AsyncOpenTelemetryTransport = AsyncOpenTelemetryTransport(transport)
         self.client: Optional[httpx.AsyncClient] = None
+        self._lock: AsyncLock = AsyncLock()
 
     async def start_client(self) -> None:
         client_kwargs = self.client_kwargs.copy()
@@ -614,15 +624,16 @@ class LimaApi(LimaApiBase):
         """
         if send_kwargs is None:
             send_kwargs = self.default_send_kwargs
-
-        auto_close = False
-        if self.auto_start and (self.client is None or self.client.is_closed):
-            auto_close = True
-            await self.__aenter__()
+        if self.auto_close:
+            async with self._lock:
+                self._open_connections += 1
 
         api_request = None
         api_response = None
         try:
+            if self.auto_start and (self.client is None or self.client.is_closed):
+                await self.__aenter__()
+
             api_request = self._create_request(
                 sync=sync,
                 method=method,
@@ -652,8 +663,11 @@ class LimaApi(LimaApiBase):
                 response=api_response,
             ) from exc
         finally:
-            if auto_close:
-                await self.__aexit__(*sys.exc_info())
+            if self.auto_close:
+                async with self._lock:
+                    self._open_connections -= 1
+                    if not bool(self._open_connections):
+                        await self.__aexit__(*sys.exc_info())
 
         response = self._create_response(
             api_response=api_response,
@@ -666,27 +680,16 @@ class LimaApi(LimaApiBase):
 
 
 class SyncLimaApi(LimaApiBase):
-    def __init__(self, *args, auto_close: bool = True, **kwargs):
-        self._auto_close: bool = auto_close and kwargs.get("auto_start", False)
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         transport = httpx.HTTPTransport(retries=self.retries)
         self.transport: SyncOpenTelemetryTransport = SyncOpenTelemetryTransport(transport)
         self.client: Optional[httpx.Client] = None
-        self._lock = Lock()
-        self._open_connections = 0
+        self._lock: SyncLock = SyncLock()
 
     def __del__(self):
         if self.client:
             self.__exit__(None, None, None)
-
-    @property
-    def auto_close(self) -> bool:
-        if self._auto_close and not self.auto_start:
-            msg = "auto_close not allowed with auto_start=False, setting off"
-            logging.warning(msg)
-            self.log(event=LogEvent.SETUP, msg=msg)
-            self._auto_close = False
-        return self._auto_close
 
     def start_client(self) -> None:
         client_kwargs = self.client_kwargs.copy()
@@ -963,6 +966,9 @@ def method_factory(method):
             if is_async:
 
                 async def _func(self: LimaApi, *args: Any, **kwargs: Any) -> Any:
+                    if not inspect.iscoroutinefunction(self.make_request):
+                        raise LimaException(detail="async function in sync client")
+
                     return await self.make_request(
                         not is_async,
                         method,
@@ -986,7 +992,7 @@ def method_factory(method):
             else:
 
                 def _func(self: SyncLimaApi, *args: Any, **kwargs: Any) -> Any:
-                    if not hasattr(self, "_lock"):
+                    if inspect.iscoroutinefunction(self.make_request):
                         raise LimaException(detail="sync function in async client")
 
                     return self.make_request(
