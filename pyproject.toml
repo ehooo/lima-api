@@ -45,6 +45,7 @@ test = [
     "pytest",
     "pytest-cov",
     "pytest-mock",
+    "pytest-asyncio",
     "pytest-httpserver",
     "freezegun",
     "ruff",
@@ -97,6 +98,9 @@ ignore = []
 pythonpath = [
   "src/"
 ]
+# asyncio_mode = "strict"  # Require explicit @pytest.mark.asyncio
+asyncio_mode = "auto"  # Automatically handle async tests
+asyncio_default_fixture_loop_scope = "function"  # New in 0.23+
 
 [tool.coverage.run]
 source = [
